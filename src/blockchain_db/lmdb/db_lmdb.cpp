@@ -3303,16 +3303,16 @@ bool BlockchainLMDB::get_blocks_from(uint64_t start_height, size_t min_block_cou
     {
       result = mdb_cursor_get(m_cur_txs_pruned, &val_tx_id, &v, op);
       if (result)
-        throw0(DB_ERROR(lmdb_error("Error attempting to retrieve transaction data from the db: ", result).c_str()));
+        throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_pruned cursor_get failed (tx_id=") + boost::lexical_cast<std::string>(tx_id) + ", op=" + boost::lexical_cast<std::string>(static_cast<int>(op)) + "): ", result).c_str()));
 
       if (pruned) {
         result = mdb_cursor_get(m_cur_txs_prunable_hash, &val_tx_id, &v, op);
         if (result)
-          throw0(DB_ERROR(lmdb_error("Error attempting to retrieve transaction data from the db: ", result).c_str()));
+          throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_prunable_hash cursor_get failed (tx_id=") + boost::lexical_cast<std::string>(tx_id) + ", op=" + boost::lexical_cast<std::string>(static_cast<int>(op)) + "): ", result).c_str()));
       } else {
         result = mdb_cursor_get(m_cur_txs_prunable, &val_tx_id, &v, op);
         if (result)
-          throw0(DB_ERROR(lmdb_error("Error attempting to retrieve transaction data from the db: ", result).c_str()));
+          throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_prunable cursor_get failed (tx_id=") + boost::lexical_cast<std::string>(tx_id) + ", op=" + boost::lexical_cast<std::string>(static_cast<int>(op)) + "): ", result).c_str()));
       }
     }
 
@@ -3326,14 +3326,14 @@ bool BlockchainLMDB::get_blocks_from(uint64_t start_height, size_t min_block_cou
       cryptonote::blobdata tx_blob;
       result = mdb_cursor_get(m_cur_txs_pruned, &val_tx_id, &v, op);
       if (result)
-        throw0(DB_ERROR(lmdb_error("Error attempting to retrieve transaction data from the db: ", result).c_str()));
+        throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_pruned cursor_get failed (per-tx loop, tx_id=") + boost::lexical_cast<std::string>(tx_id) + ", op=" + boost::lexical_cast<std::string>(static_cast<int>(op)) + "): ", result).c_str()));
       tx_blob.assign((const char*)v.mv_data, v.mv_size);
 
       if (pruned) {
         // get the prunable hash
         result = mdb_cursor_get(m_cur_txs_prunable_hash, &val_tx_id, &v, op);
         if (result)
-          throw0(DB_ERROR(lmdb_error("Error attempting to retrieve transaction data from the db: ", result).c_str()));
+          throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_prunable_hash cursor_get failed (per-tx loop, tx_id=") + boost::lexical_cast<std::string>(tx_id) + ", op=" + boost::lexical_cast<std::string>(static_cast<int>(op)) + "): ", result).c_str()));
 
         crypto::hash prunable_hash = *(const crypto::hash*)v.mv_data;
         current_block.second.push_back(std::make_tuple(tx_hash, prunable_hash, std::move(tx_blob)));
@@ -3341,7 +3341,7 @@ bool BlockchainLMDB::get_blocks_from(uint64_t start_height, size_t min_block_cou
         // get the prunable data
         result = mdb_cursor_get(m_cur_txs_prunable, &val_tx_id, &v, op);
         if (result)
-          throw0(DB_ERROR(lmdb_error("Error attempting to retrieve transaction data from the db: ", result).c_str()));
+          throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_prunable cursor_get failed (per-tx loop, tx_id=") + boost::lexical_cast<std::string>(tx_id) + ", op=" + boost::lexical_cast<std::string>(static_cast<int>(op)) + "): ", result).c_str()));
         tx_blob.append(reinterpret_cast<const char*>(v.mv_data), v.mv_size);
         current_block.second.push_back(std::make_tuple(tx_hash, crypto::null_hash, std::move(tx_blob)));
       }
