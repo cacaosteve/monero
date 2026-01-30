@@ -3338,10 +3338,25 @@ bool BlockchainLMDB::get_blocks_from(uint64_t start_height, size_t min_block_cou
       if (pruned) {
         // get the prunable hash via direct lookup by tx_id
         result = mdb_cursor_get(m_cur_txs_prunable_hash, &val_tx_id, &v, MDB_SET);
-        if (result)
-          throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_prunable_hash cursor_get failed (per-tx loop, tx_id=") + boost::lexical_cast<std::string>(tx_id) + ", op=" + boost::lexical_cast<std::string>(static_cast<int>(MDB_SET)) + "): ", result).c_str()));
 
-        crypto::hash prunable_hash = *(const crypto::hash*)v.mv_data;
+        // Correctness-first behavior: do not abort /getblocks.bin just because the prunable-hash
+        // table is missing an entry. This avoids truncating the EPEE payload mid-stream (client
+        // sees EpeeError::Short) and preserves backwards compatibility with DBs which may not have
+        // this table fully populated.
+        crypto::hash prunable_hash = crypto::null_hash;
+        if (result == MDB_NOTFOUND)
+        {
+          MWARNING("get_blocks_from: missing txs_prunable_hash entry; using null hash (tx_id=" << tx_id << ")");
+        }
+        else if (result)
+        {
+          throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_prunable_hash cursor_get failed (per-tx loop, tx_id=") + boost::lexical_cast<std::string>(tx_id) + ", op=" + boost::lexical_cast<std::string>(static_cast<int>(MDB_SET)) + "): ", result).c_str()));
+        }
+        else
+        {
+          prunable_hash = *(const crypto::hash*)v.mv_data;
+        }
+
         current_block.second.push_back(std::make_tuple(tx_hash, prunable_hash, std::move(tx_blob)));
       } else {
         // get the prunable data via direct lookup by tx_id
