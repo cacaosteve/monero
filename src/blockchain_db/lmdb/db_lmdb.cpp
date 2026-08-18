@@ -3198,6 +3198,29 @@ bool BlockchainLMDB::get_blocks_from(uint64_t start_height, size_t min_block_cou
   MDB_val_copy<uint64_t> key(start_height);
   MDB_val v, val_tx_id;
   uint64_t tx_id = ~0;
+  val_tx_id.mv_data = &tx_id;
+  val_tx_id.mv_size = sizeof(tx_id);
+
+  uint64_t missing_prunable_hash_count = 0;
+  uint64_t missing_prunable_hash_first_tx_id = 0;
+  uint64_t missing_prunable_hash_last_tx_id = 0;
+
+  auto cursor_get_tx_id = [&](MDB_cursor *cur, MDB_val &cur_key, MDB_val &cur_val, MDB_cursor_op op, const char *what) {
+    int result = mdb_cursor_get(cur, &cur_key, &cur_val, op);
+    if (result && result != MDB_NOTFOUND)
+      throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: ") + what + " failed (tx_id=" + boost::lexical_cast<std::string>(tx_id) + "): ", result).c_str()));
+    return result;
+  };
+
+  auto ensure_cursor_at_tx_id = [&](MDB_cursor *cur, MDB_val &cur_key, MDB_val &cur_val, const char *what) {
+    bool positioned = cur_key.mv_size == sizeof(uint64_t) && cur_key.mv_data &&
+      *(const uint64_t *)cur_key.mv_data == tx_id;
+    if (positioned)
+      return 0;
+    cur_key = val_tx_id;
+    return cursor_get_tx_id(cur, cur_key, cur_val, MDB_SET, what);
+  };
+
   for (uint64_t h = start_height; h < blockchain_height && blocks.size() < max_block_count && (size < max_size || blocks.size() < min_block_count); ++h)
   {
     MDB_cursor_op op = h == start_height ? MDB_SET : MDB_NEXT;
@@ -3218,75 +3241,104 @@ bool BlockchainLMDB::get_blocks_from(uint64_t start_height, size_t min_block_cou
       throw0(DB_ERROR("Invalid block"));
     current_block.first.second = get_miner_tx_hash ? cryptonote::get_transaction_hash(b.miner_tx) : crypto::null_hash;
 
-    // get the tx_id for the first tx (the first block's coinbase tx)
-    if (h == start_height)
+    // Resolve miner tx_id for every block. Streaming MDB_NEXT across block
+    // boundaries can desync txs_pruned / txs_prunable_hash under load.
     {
-      crypto::hash hash = cryptonote::get_transaction_hash(b.miner_tx);
-      MDB_val_set(v, hash);
+      crypto::hash miner_hash = cryptonote::get_transaction_hash(b.miner_tx);
+      MDB_val_set(v, miner_hash);
       result = mdb_cursor_get(m_cur_tx_indices, (MDB_val *)&zerokval, &v, MDB_GET_BOTH);
       if (result)
         throw0(DB_ERROR(lmdb_error("Error attempting to retrieve block coinbase transaction from the db: ", result).c_str()));
 
       const txindex *tip = (const txindex *)v.mv_data;
       tx_id = tip->data.tx_id;
-      val_tx_id.mv_data = &tx_id;
-      val_tx_id.mv_size = sizeof(tx_id);
     }
 
+    MDB_val pruned_key = val_tx_id;
+    MDB_val pruned_val;
+    MDB_val prunable_hash_key = val_tx_id;
+    MDB_val prunable_hash_val;
+    MDB_val prunable_key = val_tx_id;
+    MDB_val prunable_val;
+
+    result = cursor_get_tx_id(m_cur_txs_pruned, pruned_key, pruned_val, MDB_SET, "txs_pruned cursor_get");
+    if (result)
+      throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_pruned cursor_get failed (tx_id=") + boost::lexical_cast<std::string>(tx_id) + "): ", result).c_str()));
+    if (pruned)
     {
-      result = mdb_cursor_get(m_cur_txs_pruned, &val_tx_id, &v, op);
+      result = cursor_get_tx_id(m_cur_txs_prunable_hash, prunable_hash_key, prunable_hash_val, MDB_SET, "txs_prunable_hash cursor_get");
+      if (result && result != MDB_NOTFOUND)
+        throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_prunable_hash cursor_get failed (tx_id=") + boost::lexical_cast<std::string>(tx_id) + "): ", result).c_str()));
+    }
+    else
+    {
+      result = cursor_get_tx_id(m_cur_txs_prunable, prunable_key, prunable_val, MDB_SET, "txs_prunable cursor_get");
       if (result)
-        throw0(DB_ERROR(lmdb_error("Error attempting to retrieve transaction data from the db: ", result).c_str()));
-      if (!pruned)
-      {
-        result = mdb_cursor_get(m_cur_txs_prunable, &val_tx_id, &v, op);
-        if (result)
-          throw0(DB_ERROR(lmdb_error("Error attempting to retrieve transaction data from the db: ", result).c_str()));
-      }
+        throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_prunable cursor_get failed (tx_id=") + boost::lexical_cast<std::string>(tx_id) + "): ", result).c_str()));
     }
 
-    op = MDB_NEXT;
+    ++tx_id;
+    cursor_get_tx_id(m_cur_txs_pruned, pruned_key, pruned_val, MDB_NEXT, "txs_pruned advance past miner tx");
+    if (pruned)
+      cursor_get_tx_id(m_cur_txs_prunable_hash, prunable_hash_key, prunable_hash_val, MDB_NEXT, "txs_prunable_hash advance past miner tx");
+    else
+      cursor_get_tx_id(m_cur_txs_prunable, prunable_key, prunable_val, MDB_NEXT, "txs_prunable advance past miner tx");
 
     current_block.second.reserve(b.tx_hashes.size());
     num_txes += b.tx_hashes.size() + 1;
     for (const auto &tx_hash: b.tx_hashes)
     {
-      // get pruned data
-      cryptonote::blobdata tx_blob;
-      result = mdb_cursor_get(m_cur_txs_pruned, &val_tx_id, &v, op);
+      result = ensure_cursor_at_tx_id(m_cur_txs_pruned, pruned_key, pruned_val, "txs_pruned reposition");
       if (result)
-        throw0(DB_ERROR(lmdb_error("Error attempting to retrieve transaction data from the db: ", result).c_str()));
-      tx_blob.assign((const char*)v.mv_data, v.mv_size);
+        throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_pruned cursor_get failed (reposition, tx_id=") + boost::lexical_cast<std::string>(tx_id) + "): ", result).c_str()));
+
+      cryptonote::blobdata tx_blob;
+      tx_blob.assign((const char*)pruned_val.mv_data, pruned_val.mv_size);
 
       crypto::hash prunable_hash = crypto::null_hash;
       if (pruned)
       {
-        MDB_val v_hash;
-        result = mdb_cursor_get(m_cur_txs_prunable_hash, &val_tx_id, &v_hash, MDB_SET);
-        if (result == 0)
+        result = ensure_cursor_at_tx_id(m_cur_txs_prunable_hash, prunable_hash_key, prunable_hash_val, "txs_prunable_hash reposition");
+        if (result == MDB_NOTFOUND)
         {
-          prunable_hash = *(const crypto::hash*)v_hash.mv_data;
+          if (missing_prunable_hash_count == 0)
+            missing_prunable_hash_first_tx_id = tx_id;
+          missing_prunable_hash_last_tx_id = tx_id;
+          ++missing_prunable_hash_count;
         }
-        else if (result != MDB_NOTFOUND)
+        else if (result)
         {
-          throw0(DB_ERROR(lmdb_error("Error attempting to retrieve transaction prunable hash from the db: ", result).c_str()));
+          throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_prunable_hash cursor_get failed (per-tx loop, tx_id=") + boost::lexical_cast<std::string>(tx_id) + "): ", result).c_str()));
         }
+        else
+        {
+          prunable_hash = *(const crypto::hash*)prunable_hash_val.mv_data;
+        }
+        cursor_get_tx_id(m_cur_txs_prunable_hash, prunable_hash_key, prunable_hash_val, MDB_NEXT, "txs_prunable_hash advance");
       }
       else
       {
-        // get the prunable data
-        result = mdb_cursor_get(m_cur_txs_prunable, &val_tx_id, &v, op);
+        result = ensure_cursor_at_tx_id(m_cur_txs_prunable, prunable_key, prunable_val, "txs_prunable reposition");
         if (result)
-          throw0(DB_ERROR(lmdb_error("Error attempting to retrieve transaction data from the db: ", result).c_str()));
-        tx_blob.append(reinterpret_cast<const char*>(v.mv_data), v.mv_size);
+          throw0(DB_ERROR(lmdb_error(std::string("get_blocks_from: txs_prunable cursor_get failed (reposition, tx_id=") + boost::lexical_cast<std::string>(tx_id) + "): ", result).c_str()));
+        tx_blob.append(reinterpret_cast<const char*>(prunable_val.mv_data), prunable_val.mv_size);
+        cursor_get_tx_id(m_cur_txs_prunable, prunable_key, prunable_val, MDB_NEXT, "txs_prunable advance");
       }
       current_block.second.emplace_back(tx_hash, prunable_hash, std::move(tx_blob));
 
       size += std::get<2>(current_block.second.back()).size();
+      cursor_get_tx_id(m_cur_txs_pruned, pruned_key, pruned_val, MDB_NEXT, "txs_pruned advance");
+      ++tx_id;
     }
 
     if (blocks.size() >= min_block_count && num_txes >= max_tx_count)
       break;
+  }
+
+  if (missing_prunable_hash_count > 0)
+  {
+    LOG_PRINT_L1("get_blocks_from(pruned=" << (pruned ? 1 : 0) << "): missing txs_prunable_hash entries: " << missing_prunable_hash_count
+      << " (tx_id " << missing_prunable_hash_first_tx_id << ".." << missing_prunable_hash_last_tx_id << "); returning null prunable_hash for those txs");
   }
 
   TXN_POSTFIX_RDONLY();
